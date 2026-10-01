@@ -1,0 +1,276 @@
+# =============================================================================
+# mydatama 范例：数据资产入表主链路（正面路径 + 用户视角 + 落库断言）
+#
+# 运行前提：
+#   1. mydatama 平台已启动（门户 http://localhost:8090，四容器 healthy）
+#   2. 在 mydatama-video 仓库根目录执行（样例 CSV 在 assets/fixtures/ 下），
+#      或把 samples_dir 指向你本地样例目录
+#   3. 环境变量：BASE_URL / ADMIN_USER / ADMIN_PASS / SAMPLES_DIR
+#      （SAMPLES_DIR 指向样例目录，可由 mydatama-video 生成器产出：
+#        python mydatama-video/assets/fixtures/generator/generate_all.py）；
+#      PLATFORM_DSN 可选，设置后启用落库层断言
+#   4. python d:/.../flowtest-kit/kit/runner.py flow-mydatama-main.flow.yaml
+#
+# 本流程的所有接口契约均来自 mydatama v0.1.0 真实动线，
+# 与 mydatama-video 的 scenario.py 一一对应。
+# =============================================================================
+
+meta:
+  name: mydatama-main-flow
+  title: 数据上传治理→数据集版本→产品合规挂牌
+  role: admin
+  value: 管理员把原始数据治理成可挂牌的数据产品
+  priority: P0
+
+env:
+  base_url: "${BASE_URL}"
+
+healthcheck:
+  path: /
+  expect_status: 200
+  timeout: 180
+  interval: 5
+
+auth:
+  login:
+    method: POST
+    path: /api/auth/login
+    json: {username: "${ADMIN_USER}", password: "${ADMIN_PASS}"}
+    token_path: data.accessToken
+    captures: {uid: data.user.id}
+  header_template: {Authorization: "Bearer ${token}"}
+  inject:
+    type: localStorage
+    key: mydatama_auth
+    value: '{"accessToken":"${token}","refreshToken":"","user":{"id":${uid},"username":"${ADMIN_USER}"}}'
+
+steps:
+  # ---- ① 五阶段治理：上传（缺陷 A 曾在此 500）-------------------------
+  - id: upload_0901
+    title: 上传 5 万行 GPS 样例（契约层）
+    type: api
+    request:
+      method: POST
+      path: /api/processing/files
+      files: [{field: file, path: "${SAMPLES_DIR}/vehicle_gps_20260901.csv"}]
+      form: {bizDomain: TRANSPORT, secretLevel: "2"}
+    assert:
+      code: 0
+      data.fileId: {op: exists}
+    capture: {fileId: data.fileId}
+
+  - id: wait_processed
+    title: 轮询至 READY（条件等待，禁止 sleep）
+    type: poll
+    request: {method: GET, path: "/api/processing/files/${fileId}"}
+    until: {data.status: READY}
+    terminate: {data.status: FAILED}
+    timeout: 300
+    interval: 3
+    assert:
+      # 缺陷 D 曾在此通过 200 但前端渲染全空：枚举与字段名必须对齐前端
+      data.latestJob.status: SUCCESS
+      data.maskColumns: {op: contains, value: driver_phone}
+
+  - id: repair_rerun
+    title: 一键修复后重跑仍 READY
+    type: poll
+    request: {method: POST, path: "/api/processing/files/${fileId}/repair"}
+    until: {data.status: READY}
+    terminate: {data.status: FAILED}
+    timeout: 300
+    interval: 3
+
+  # ---- ② 呈现层：真实浏览器验证用户所见（缺陷 D 的专属拦截位）-----------
+  - id: page_file_detail
+    title: 文件详情页：文件名/成功标签/脱敏列可见
+    type: ui
+    route: "/processing/files/${fileId}"
+    wait:
+      networkidle: true
+      selector: ".card-title"
+      seconds: 1
+    dom:
+      - {selector: ".card-title", expect: text, value: "vehicle_gps_20260901"}
+      - {selector: ".el-tag--success", expect: visible}
+      - {selector: ".mask-tag", expect: count_gte, value: 2}
+      - {selector: ".mask-tag", expect: text, value: "driver_phone"}
+      - {selector: ".login-page", expect: hidden}
+    screenshot: file_detail.png
+
+  # ---- ③ 数据集 v1/v2（缺陷 B 曾在此 NOT NULL 违约）--------------------
+  - id: create_dataset
+    title: 创建驾驶行为样本集
+    type: api
+    request:
+      method: POST
+      path: /api/dataset/datasets
+      json:
+        name: "驾驶行为样本集-${RUN_ID}"
+        scenario: 驾驶行为分析
+        description: 流程测试自动创建
+        filterCond: {modality: STRUCTURED, bizDomain: TRANSPORT, secretLevelMax: 4}
+    assert:
+      code: 0
+      data.id: {op: exists}
+    capture: {dsId: data.id}
+
+  - id: dataset_version_v1
+    title: 生成 v1（真实键名 versionId）
+    type: api
+    request:
+      method: POST
+      path: "/api/dataset/datasets/${dsId}/versions"
+      json: {changeNote: "v1 ${RUN_ID}"}
+    assert:
+      code: 0
+      data.versionId: {op: exists}
+    capture: {v1Id: data.versionId}
+
+  - id: upload_0902
+    title: 追加 GBK/中文列名样例并产出 v2
+    type: api
+    request:
+      method: POST
+      path: /api/processing/files
+      files: [{field: file, path: "${SAMPLES_DIR}/vehicle_gps_20260902.csv"}]
+      form: {bizDomain: TRANSPORT, secretLevel: "2"}
+    capture: {fileId2: data.fileId}
+
+  - id: wait_0902
+    title: 等待 0902 治理完成
+    type: poll
+    request: {method: GET, path: "/api/processing/files/${fileId2}"}
+    until: {data.status: READY}
+    terminate: {data.status: FAILED}
+    timeout: 300
+    interval: 3
+
+  - id: dataset_version_v2
+    title: v2 itemCount 增长
+    type: api
+    request:
+      method: POST
+      path: "/api/dataset/datasets/${dsId}/versions"
+      json: {changeNote: "v2 ${RUN_ID}"}
+    assert:
+      code: 0
+      data.itemCount: {op: gte, value: 2}
+    capture: {v2Id: data.versionId}
+
+  # ---- ④ 正面产品：配置→生成→四绿→登记→挂牌（缺陷 C 曾在合规落库）------
+  - id: get_template
+    title: 内置数据包模板存在
+    type: api
+    request: {method: GET, path: /api/product/templates}
+    assert:
+      code: 0
+      data.0.code: tpl-data-package-v1
+    capture: {tplId: data.0.id}
+
+  - id: create_product
+    title: 创建数据包产品（DRAFT）
+    type: api
+    request:
+      method: POST
+      path: /api/product/products
+      json:
+        templateId: "${tplId}"
+        name: "精算样本集-${RUN_ID}"
+        code: "PRD-${RUN_ID}"
+        datasetVersionId: "${v2Id}"
+        secretLevel: 2
+        category: 交通物流
+        pricingModel: PER_MONTH
+        price: 1999.00
+        description: flowtest-kit 自动化
+        manualMeta: {sourceDesc: GPS, fieldDesc: 车牌/定位/司机联系方式(已脱敏), updateFreq: 每月, deliveryMode: zip}
+    assert:
+      code: 0
+      data.status: DRAFT
+    capture: {posId: data.id}
+
+  - id: configure
+    title: 配置完成 → CONFIGURED
+    type: api
+    request: {method: POST, path: "/api/product/products/${posId}/configure"}
+    assert: {code: 0, data.status: CONFIGURED}
+
+  - id: generate
+    title: 生成产物 → GENERATED
+    type: api
+    request: {method: POST, path: "/api/product/products/${posId}/generate"}
+    assert: {code: 0, data.status: GENERATED}
+
+  - id: compliance_passed
+    title: 合规四绿 → PASSED
+    type: api
+    request: {method: POST, path: "/api/product/products/${posId}/compliance/run"}
+    assert:
+      code: 0
+      data.status: PASSED
+      data.items: {op: exists}
+    capture: {posBatch: data.batchNo}
+
+  - id: register
+    title: 登记返回凭证号
+    type: api
+    request: {method: POST, path: "/api/product/products/${posId}/register"}
+    assert:
+      code: 0
+      data.regNo: {op: regex, value: "^REG-"}
+
+  - id: listing
+    title: 挂牌 → LISTED
+    type: api
+    request: {method: POST, path: "/api/product/products/${posId}/listing"}
+    assert: {code: 0}
+
+  # ---- ⑤ 呈现层：挂牌产品页 + 数据大屏 -------------------------------
+  - id: page_product_listed
+    title: 产品详情页展示已挂牌产品
+    type: ui
+    route: "/product/${posId}"
+    wait: {networkidle: true, selector: ".card-title", seconds: 1}
+    dom:
+      - {selector: ".card-title", expect: text, value: "精算样本集-${RUN_ID}"}
+      - {selector: ".login-page", expect: hidden}
+    screenshot: product_listed.png
+
+  - id: page_screen
+    title: 数据大屏可打开
+    type: ui
+    route: /screen
+    wait: {networkidle: true, seconds: 1}
+    screenshot: screen.png
+
+  # ---- ⑥ 落库层：审计列与合规记录真实持久化（A/B/C 三缺陷回归位）---------
+  - id: db_file_raw_path
+    title: 文件 raw_path 已回填且非空
+    type: sql
+    required_env: PLATFORM_DSN
+    dsn_env: PLATFORM_DSN
+    query: "SELECT raw_path FROM proc.data_files WHERE id = ${fileId}"
+    assert:
+      row_count: 1
+      non_null: [raw_path]
+
+  - id: db_dataset_audit
+    title: 数据集 create_by 自动填充
+    type: sql
+    required_env: PLATFORM_DSN
+    dsn_env: PLATFORM_DSN
+    query: "SELECT create_by FROM ds.datasets WHERE id = ${dsId}"
+    assert:
+      row_count: 1
+      first_row: {create_by: "${ADMIN_USER}"}
+
+  - id: db_compliance_rows
+    title: 四条合规记录全部带操作者（缺陷 C 回归）
+    type: sql
+    required_env: PLATFORM_DSN
+    dsn_env: PLATFORM_DSN
+    query: "SELECT count(*) AS n, count(create_by) AS with_by FROM prod.compliance_checks WHERE batch_no = '${posBatch}'"
+    assert:
+      row_count: 1
+      first_row: {n: 4, with_by: 4}

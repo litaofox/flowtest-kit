@@ -1,0 +1,11 @@
+# flowtest-kit 运行依赖（Python 3.10+）
+requests>=2.31
+PyYAML>=6.0
+pytest>=7.4
+playwright>=1.40
+python-dotenv>=1.0
+Pillow>=10.0
+# SQL 落库断言需要（仅用到对应步骤时必需，支持 PostgreSQL；
+# 其他数据库可在 runner.py 的 sql handler 中替换驱动）
+psycopg2-binary>=2.9
+# 安装后还需执行一次：python -m playwright install chromium

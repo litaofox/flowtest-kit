@@ -1,0 +1,139 @@
+# =============================================================================
+# 业务流程定义模板（流程 IR）—— 复制到项目的 flows/ 目录后按注释填写
+# 一份 YAML = 一条用户价值链；字段定义同步见 docs/方案设计说明书.md 第四章
+# 变量来源：环境变量（含 .env）与前置步骤 capture；引用写法 ${NAME}
+# 本地试跑：python /path/to/kit/runner.py flows/xxx.flow.yaml
+# =============================================================================
+
+meta:
+  name: main-order-flow            # 流程唯一标识（也用于产物目录名）
+  title: 下单支付主链路
+  role: 业务员                      # 主角色；多角色切换写在步骤标题里
+  value: 用户能完成选品→下单→支付   # 一句话业务价值，供评审判断链路是否成立
+  priority: P0                     # P0 主路径 / P1 重要分支 / P2 异常
+
+env:
+  base_url: "${BASE_URL}"          # 被测系统地址，只从环境变量读
+
+# ---- 可选：环境重置（危险动作，双重开关：此处声明 + 运行时 ALLOW_RESET=1）----
+reset:
+  cwd: "."
+  commands:
+    - "docker compose down -v"
+    - "docker compose up -d"
+
+# ---- 健康检查：通过后才开始登录与执行 ----
+healthcheck:
+  path: /health                    # 探测路径
+  expect_status: 200
+  expect_json: {code: 0}           # 可选 JSON 断言（写法同步骤 assert）
+  timeout: 180
+  interval: 5
+
+# ---- 登录与登录态注入 ----
+auth:
+  login:
+    method: POST
+    path: /api/auth/login
+    json: {username: "${ADMIN_USER}", password: "${ADMIN_PASS}"}
+    token_path: data.accessToken   # 令牌在响应中的点路径
+    captures: {userId: data.user.id}   # 额外捕获的变量
+  header_template: {Authorization: "Bearer ${token}"}   # 后续 API 鉴权头
+  # 浏览器登录态注入（二选一或同时）：
+  inject:
+    type: localStorage             # localStorage | cookies
+    key: my_app_auth
+    # 前端存什么结构就注入什么结构；${token} 由登录步骤提供
+    value: '{"accessToken":"${token}","user":{"id":${userId}}}'
+    # type: cookies 时写法：
+    # cookies:
+    #   - {name: SESSION, value: "${token}", path: /}
+
+steps:
+  # -------------------------------------------------------------------------
+  # 步骤类型 1：api（HTTP 调用；支持 multipart 上传）
+  # -------------------------------------------------------------------------
+  - id: create_order
+    title: 创建订单（契约层：状态与字段）
+    type: api
+    request:
+      method: POST
+      path: /api/orders
+      json: {sku: "SKU-${RUN_ID}", qty: 1}
+    retries: 2                     # 仅对 429/5xx/网络错误重试；断言失败不重试
+    assert:
+      code: 0                      # 短写 = {op: eq, value: 0}
+      http_status: 200
+      data.status: CREATED
+      data.orderNo: {op: regex, value: "^ORD-\\d{8}-"}
+    capture: {orderId: data.id}    # 供后续步骤引用 ${orderId}
+
+  # 文件上传示例：
+  # request:
+  #   method: POST
+  #   path: /api/files
+  #   files: [{field: file, path: "samples/5w_rows.csv"}]
+  #   form: {bizDomain: TRANSPORT, secretLevel: 1}
+
+  # -------------------------------------------------------------------------
+  # 步骤类型 2：poll（异步任务轮询，条件等待替代 sleep）
+  # -------------------------------------------------------------------------
+  - id: wait_paid
+    title: 等待支付到账
+    type: poll
+    request: {method: GET, path: "/api/orders/${orderId}"}
+    until: {data.status: PAID}     # 全部满足即结束
+    terminate: {data.status: CLOSED}   # 命中即失败（走到非法/终态）
+    timeout: 120
+    interval: 3
+    assert: {data.paid: true}      # 轮询成功后仍可追加断言
+
+  # -------------------------------------------------------------------------
+  # 步骤类型 3：ui（真实浏览器，呈现层断言 + 截图取证）
+  # -------------------------------------------------------------------------
+  - id: page_order_detail
+    title: 订单详情页用户可见
+    type: ui
+    route: /orders/${orderId}
+    wait:
+      networkidle: true            # 等异步请求收敛
+      selector: "[data-testid=order-status]"   # 关键元素出现
+      seconds: 1                   # 渲染宽限，上限 2s
+    dom:
+      - {selector: "[data-testid=order-status]", expect: text, value: "已支付"}
+      - {selector: "[data-testid=line-item]", expect: count_gte, value: 1}
+      - {selector: "[data-testid=amount]", expect: attr:title, value: "99.5"}
+      - {selector: ".login-page", expect: hidden}
+    screenshot: order_detail.png   # 归档到 test-output/.../screenshots/
+    mask: ["[data-testid=phone]"]  # 敏感元素打码后再存证
+    # visual:                       # 可选视觉回归（默认关）
+    #   baseline: baselines/order_detail.png
+    #   threshold: 0.02
+
+  # 空态时序：把空态 UI 步骤放在造数步骤之前（先发步骤 id 前缀 z_ 或拆流程）
+
+  # -------------------------------------------------------------------------
+  # 步骤类型 4：sql（落库层断言，默认只读）
+  # -------------------------------------------------------------------------
+  - id: db_audit_column
+    title: 审计列真实落库
+    type: sql
+    dsn_env: PLATFORM_DSN          # 从环境变量取连接串，禁止硬编码
+    query: "SELECT id, create_by, created_at FROM biz.orders WHERE id = ${orderId}"
+    assert:
+      row_count: 1
+      first_row: {create_by: "${ADMIN_USER}"}
+      non_null: [created_at]
+    # allow_write: true            # 仅演示造数场景；默认禁止任何非 SELECT/WITH
+
+  # -------------------------------------------------------------------------
+  # 反面路径：系统应正确拒绝；放行才是缺陷
+  # -------------------------------------------------------------------------
+  - id: cross_tenant_forbidden
+    title: 跨租户访问应被拒绝（403）
+    type: api
+    request: {method: GET, path: "/api/orders/999999"}
+    expect_failure: true           # 期望 4xx 或业务 code!=0；成功反而 FAIL
+    assert:
+      http_status_in: [403, 404]
+    continue_on_failure: false     # 默认失败即中止整条链路

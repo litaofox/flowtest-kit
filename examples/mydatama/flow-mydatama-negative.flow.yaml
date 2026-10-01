@@ -1,0 +1,166 @@
+# =============================================================================
+# mydatama 范例：反面路径——密级倒挂必须被合规引擎拦截（BLOCKED）
+#
+# 背景：平台 configure 接口会硬性拒绝倒挂配置（这是正确的安全设计），
+# 因此要在 UI 上复现「生成后数据被降级 → R1 亮红」，需要测试专用造数开关：
+#   DEMO_TWEAK_DSN=host=... port=5432 dbname=mydatama user=... password=...
+# 未设置时，本流程的造数步骤及之后步骤会被跳过（required_env），
+# 不会误报；401/403 等纯接口反面断言不依赖 DSN。
+# =============================================================================
+
+meta:
+  name: mydatama-negative-flow
+  title: 密级倒挂产品合规拦截
+  role: admin
+  value: 高密级资产不得包装成低密级产品对外挂牌
+  priority: P0
+
+env:
+  base_url: "${BASE_URL}"
+
+healthcheck:
+  path: /
+  expect_status: 200
+  timeout: 180
+  interval: 5
+
+auth:
+  login:
+    method: POST
+    path: /api/auth/login
+    json: {username: "${ADMIN_USER}", password: "${ADMIN_PASS}"}
+    token_path: data.accessToken
+    captures: {uid: data.user.id}
+  header_template: {Authorization: "Bearer ${token}"}
+  inject:
+    type: localStorage
+    key: mydatama_auth
+    value: '{"accessToken":"${token}","refreshToken":"","user":{"id":${uid},"username":"${ADMIN_USER}"}}'
+
+steps:
+  # ---- 纯接口反面断言：未带凭证访问受保护接口必须 401/403 ----------------
+  - id: anonymous_rejected
+    title: 匿名访问产品列表被拒绝（反面路径，不依赖 DSN）
+    type: api
+    request: {method: GET, path: /api/product/products, no_auth: true}
+    expect_failure: true
+    assert:
+      http_status_in: [401, 403]
+
+  # ---- 反面主路径：明文密级 3 资产 → 合规流程 ---------------------------
+  - id: upload_unmasked
+    title: 上传明文样例（密级 3）
+    type: api
+    request:
+      method: POST
+      path: /api/processing/files
+      files: [{field: file, path: "${SAMPLES_DIR}/unmasked_sample.csv"}]
+      form: {bizDomain: RISK, secretLevel: "3"}
+    assert: {code: 0}
+    capture: {negFileId: data.fileId}
+
+  - id: wait_unmasked_ready
+    title: 明文样例治理完成
+    type: poll
+    request: {method: GET, path: "/api/processing/files/${negFileId}"}
+    until: {data.status: READY}
+    terminate: {data.status: FAILED}
+    timeout: 300
+    interval: 3
+
+  - id: create_risk_dataset
+    type: api
+    request:
+      method: POST
+      path: /api/dataset/datasets
+      json:
+        name: "风险明文样例集-${RUN_ID}"
+        scenario: 合规反面演示
+        description: 密级倒挂拦截演示
+        filterCond: {bizDomain: RISK, secretLevelMax: 4}
+    assert: {code: 0}
+    capture: {negDsId: data.id}
+
+  - id: risk_version
+    type: api
+    request:
+      method: POST
+      path: "/api/dataset/datasets/${negDsId}/versions"
+      json: {changeNote: "明文版本 ${RUN_ID}"}
+    assert: {code: 0}
+    capture: {negVersionId: data.versionId}
+
+  - id: get_template
+    type: api
+    request: {method: GET, path: /api/product/templates}
+    capture: {tplId: data.0.id}
+
+  - id: create_neg_product
+    title: 先按合规密级 3 创建并生成
+    type: api
+    request:
+      method: POST
+      path: /api/product/products
+      json:
+        templateId: "${tplId}"
+        name: "明文风险样例-${RUN_ID}"
+        code: "PRD-${RUN_ID}-X"
+        datasetVersionId: "${negVersionId}"
+        secretLevel: 3
+        category: 风险合规
+        pricingModel: PER_MONTH
+        price: 1.00
+        description: 反面流程
+        manualMeta: {sourceDesc: 明文样例, fieldDesc: 未脱敏, updateFreq: 单次, deliveryMode: api}
+    assert: {data.status: DRAFT}
+    capture: {negId: data.id}
+
+  - id: neg_configure
+    type: api
+    request: {method: POST, path: "/api/product/products/${negId}/configure"}
+    assert: {data.status: CONFIGURED}
+
+  - id: neg_generate
+    type: api
+    request: {method: POST, path: "/api/product/products/${negId}/generate"}
+    assert: {data.status: GENERATED}
+
+  # ---- 测试专用造数：把产品密级降为 1（默认关闭，仅限演示库）------------
+  - id: demo_lower_level
+    title: 【仅演示库】造数降级以触发 R1
+    type: sql
+    required_env: DEMO_TWEAK_DSN
+    dsn_env: DEMO_TWEAK_DSN
+    allow_write: true
+    query: "UPDATE prod.products SET secret_level=1, updated_at=now() WHERE id=${negId}"
+
+  - id: compliance_blocked_api
+    title: 合规校验必须 BLOCKED（契约层）
+    type: api
+    required_env: DEMO_TWEAK_DSN
+    request: {method: POST, path: "/api/product/products/${negId}/compliance/run"}
+    assert:
+      code: 0
+      data.status: BLOCKED
+    capture: {negBatch: data.batchNo}
+
+  - id: page_product_blocked
+    title: 产品页红屏「合规拦阻」（呈现层）
+    type: ui
+    required_env: DEMO_TWEAK_DSN
+    route: "/product/${negId}"
+    wait: {networkidle: true, selector: ".card-title", seconds: 1}
+    dom:
+      - {selector: ".el-step__title", expect: text, value: "合规拦阻"}
+      - {selector: ".login-page", expect: hidden}
+    screenshot: product_blocked.png
+
+  - id: db_blocked_row
+    title: R1 规则行落库为不通过（落库层）
+    type: sql
+    required_env: DEMO_TWEAK_DSN
+    dsn_env: DEMO_TWEAK_DSN
+    query: "SELECT count(*) AS blocked FROM prod.compliance_checks WHERE batch_no='${negBatch}' AND passed=false"
+    assert:
+      row_count: 1
+      first_row: {blocked: 1}

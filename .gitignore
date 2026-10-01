@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 测试产物
+test-output/
+baselines/__tmp__/
+
+# 环境与密钥
+.env
+*.local
+
+# 编辑器
+.idea/
+.vscode/
